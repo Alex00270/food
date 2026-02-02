@@ -134,6 +134,170 @@ def clean_number(value_str):
     except:
         return 0.0
 
+def extract_number_and_unit(value_str):
+    """
+    Extracts number and unit of measurement from string.
+    Examples:
+        "3 000 ДЕТ ДН" -> (3000.0, "ДЕТ ДН")
+        "2 233 843,92 Ставка НДС: Без НДС" -> (2233843.92, "Ставка НДС: Без НДС")
+        "1 200,00 ₽" -> (1200.0, "₽")
+        "5" -> (5.0, "")
+    """
+    if not value_str:
+        return 0.0, ""
+    
+    # First line usually contains the main value
+    main_line = value_str.split('\n')[0].strip()
+    
+    # Find the number
+    number_match = re.search(r'(\d+[.,\s\d]*\d*)', main_line)
+    if not number_match:
+        return 0.0, ""
+    
+    number_str = number_match.group(1)
+    
+    # Clean and convert the number
+    try:
+        # Remove spaces (thousands separator)
+        number_str = number_str.replace(' ', '').replace('\xa0', '')
+        # Replace comma with dot for decimal
+        number_str = number_str.replace(',', '.')
+        number = float(number_str)
+    except ValueError:
+        try:
+            match = re.search(r'\d+\.?\d*', number_str)
+            if match:
+                number = float(match.group())
+            else:
+                return 0.0, ""
+        except:
+            return 0.0, ""
+    
+    # Extract unit (everything after the number)
+    unit_part = main_line[number_match.end():].strip()
+    
+    # Keep currency symbols if they are the only unit
+    if unit_part and not unit_part.replace('₽', '').replace('RUB', '').strip():
+        # Only currency symbols - keep one
+        if '₽' in unit_part:
+            unit_part = '₽'
+        elif 'RUB' in unit_part:
+            unit_part = 'RUB'
+        else:
+            unit_part = ''
+    else:
+        # Remove common currency symbols to extract real unit
+        unit_part = unit_part.replace('₽', '').replace('RUB', '').strip()
+    
+    return number, unit_part
+
+def is_total_row(name):
+    """
+    Determines if a row is a total/summary row.
+    """
+    if not name:
+        return False
+    
+    total_keywords = ["итого", "всего", "total", "сумма", "合计", "정리", "подитог", "общий"]
+    name_lower = name.lower().strip()
+    
+    return any(keyword in name_lower for keyword in total_keywords)
+
+def parse_price_info(obj):
+    """
+    Parses price information from object and returns clean data.
+    Returns dict with: name, category, price, price_unit, total_sum, total_unit, qty
+    """
+    name = obj.get('name', '')
+    category = obj.get('category', 'Прочее')
+    price_raw = obj.get('price', '0')
+    total_raw = obj.get('total', '0')
+    
+    # Extract price and unit
+    price, price_unit = extract_number_and_unit(price_raw)
+    
+    # Extract total sum and unit
+    total_sum, total_unit = extract_number_and_unit(total_raw)
+    
+    # Calculate quantity if possible
+    qty = 0
+    if price > 0 and total_sum > 0:
+        qty = round(total_sum / price, 2)
+    
+    return {
+        'name': name,
+        'category': category,
+        'price': price,
+        'price_unit': price_unit,
+        'total_sum': total_sum,
+        'total_unit': total_unit,
+        'qty': qty
+    }
+
+def validate_totals(objects_data, calculated_total):
+    """
+    Validates parsed totals vs calculated totals.
+    Returns validation result dict.
+    """
+    # Extract parsed total from objects (excluding total rows)
+    parsed_total = 0.0
+    has_parsed_total = False
+    
+    for obj in objects_data:
+        if is_total_row(obj.get('name', '')):
+            # This is a total row from parser
+            total_raw = obj.get('total', '0')
+            total_value, _ = extract_number_and_unit(total_raw)
+            if total_value > 0:
+                parsed_total = total_value
+                has_parsed_total = True
+                break
+    
+    # If no explicit total row, calculate sum of all non-total items
+    if not has_parsed_total:
+        for obj in objects_data:
+            if not is_total_row(obj.get('name', '')):
+                total_raw = obj.get('total', '0')
+                total_value, _ = extract_number_and_unit(total_raw)
+                parsed_total += total_value
+    
+    # Check for discrepancy
+    difference = abs(parsed_total - calculated_total)
+    is_valid = difference <= 0.01  # Any difference over 0.01 is invalid
+    
+    return {
+        'parsed_total': parsed_total,
+        'calculated_total': calculated_total,
+        'difference': difference,
+        'is_valid': is_valid,
+        'has_parsed_total': has_parsed_total
+    }
+
+def format_validation_message(validation_result):
+    """
+    Formats validation message for Telegram.
+    Returns message string or None if valid.
+    """
+    if validation_result['is_valid']:
+        return "✅ **Данные корректны**\nСуммы совпадают, ошибок парсинга не обнаружено."
+    
+    msg = "⚠️ **Обнаружено расхождение сумм!**\n\n"
+    
+    if validation_result['has_parsed_total']:
+        msg += f"Сумма по парсеру: {validation_result['parsed_total']:,.2f}\n"
+    else:
+        msg += f"Сумма по данным: {validation_result['parsed_total']:,.2f}\n"
+    
+    msg += f"Расчетная сумма: {validation_result['calculated_total']:,.2f}\n"
+    msg += f"Разница: {validation_result['difference']:,.2f}\n\n"
+    msg += "🔍 **Рекомендуется проверить данные вручную**\n"
+    msg += "Возможные причины:\n"
+    msg += "• Некорректное определение единиц измерения\n"
+    msg += "• Ошибка в исходных данных\n"
+    msg += "• Пропущены позиции при парсинге"
+    
+    return msg
+
 # --- SHEET CREATION ---
 def add_contract_to_master(data):
     """
@@ -183,7 +347,7 @@ def add_contract_to_master(data):
             ["Принято (Акты)", accepted_clean],
             ["Остаток лимита", f"={contract_price_clean}-{accepted_clean}"], # Formula
             [],
-            ["ОБЪЕКТЫ ЗАКУПКИ", "Цена", "Всего", "Сумма (Расчет)", "Название"] 
+            ["ОБЪЕКТЫ ЗАКУПКИ", "Кол-во", "Ед.изм.", "Цена", "Сумма (Источник)", "Сумма (Расчет)", "Название"] 
         ]
         
         for row in info_data:
@@ -193,47 +357,51 @@ def add_contract_to_master(data):
         objects = data.get('objects', [])
         start_row = len(info_data) + 1
         
-        if objects:
-            for i, obj in enumerate(objects):
-                name = obj.get('name', '')
-                
-                # Skip "Total" rows from source if parser caught them
-                if "итого" in name.lower():
-                    continue
-                    
-                price = clean_number(obj.get('price'))
-                total_sum_source = clean_number(obj.get('total')) # This is usually "Sum", not "Quantity" in zakupki table?
-                # Actually, in zakupki table: Price per unit | Quantity | Total Sum
-                # Our parser returns: name, price, total (which is likely Total Sum from column 6)
-                # We need to deduce Quantity = Total / Price if possible, or parse Quantity explicitly
-                
-                # Let's assume 'total' from parser is the 'Total Sum' column.
-                # If Price > 0, we can calc Qty, or leave it 0
-                qty = 0
-                if price > 0 and total_sum_source > 0:
-                    qty = round(total_sum_source / price, 2)
-                
+        # Filter out total rows and parse all objects
+        parsed_objects = []
+        for obj in objects:
+            if not is_total_row(obj.get('name', '')):
+                parsed_obj = parse_price_info(obj)
+                parsed_objects.append(parsed_obj)
+        
+        if parsed_objects:
+            # Calculate totals for validation
+            calculated_total = sum(obj['total_sum'] for obj in parsed_objects)
+            
+            for i, obj in enumerate(parsed_objects):
                 # Row index for formula (1-based)
                 current_row = start_row + i + 1
                 
                 ws.append_row([
                     "-", # Date
-                    obj.get('category', 'Прочее'), 
-                    qty, # Calculated Qty or 0
-                    price, 
-                    total_sum_source, # Source Sum
-                    f"=C{current_row}*D{current_row}", # Formula check
-                    name 
+                    obj['qty'], # Calculated Quantity
+                    obj['price_unit'] if obj['price_unit'] else obj['total_unit'], # Unit of measurement
+                    obj['price'], # Price per unit
+                    obj['total_sum'], # Source Sum
+                    f"=B{current_row}*D{current_row}", # Formula: Qty * Price
+                    obj['name'] # Item name
                 ])
                 
             # Add Total Check Formula
-            last_row = start_row + len(objects)
-            ws.append_row(["ИТОГО", "", "", "", f"=SUM(E{start_row+1}:E{last_row})", f"=SUM(F{start_row+1}:F{last_row})"])
+            last_row = start_row + len(parsed_objects)
+            ws.append_row([
+                "ИТОГО", 
+                "", 
+                "", 
+                "", 
+                f"=SUM(E{start_row+1}:E{last_row})", # Sum of source totals
+                f"=SUM(F{start_row+1}:F{last_row})", # Sum of calculated totals
+                ""
+            ])
+            
+            # Validate totals and return validation result
+            validation_result = validate_totals(objects, calculated_total)
             
         else:
             ws.append_row(["(Детализация товаров не найдена или не спарсилась)"])
+            validation_result = None
 
-        return ws.url, None
+        return ws.url, validation_result
         
     except Exception as e:
         error_details = traceback.format_exc()
@@ -332,15 +500,18 @@ def handle_zakupki_link(message):
     
     # Update Sheet
     bot.reply_to(message, "⏳ Добавляю в таблицу...")
-    sheet_url, warning = add_contract_to_master(data)
+    sheet_url, validation_result = add_contract_to_master(data)
     
     if sheet_url:
         msg = f"📊 **Лист создан!**\n\nСсылка: {sheet_url}"
-        if warning:
-            msg += f"\n(Примечание: {warning})"
         bot.reply_to(message, msg)
+        
+        # Add validation message if we have validation results
+        if validation_result:
+            validation_msg = format_validation_message(validation_result)
+            bot.reply_to(message, validation_msg, parse_mode='Markdown')
     else:
-        bot.reply_to(message, f"❌ Ошибка записи в таблицу: {warning}")
+        bot.reply_to(message, f"❌ Ошибка записи в таблицу")
 
 if __name__ == '__main__':
     logging.info("Бот запущен...")

@@ -54,6 +54,9 @@ current_sheet_id = None
 MASTER_SHEET_ID = "1GABj9RzjYIIXLnUTULQq9MnMsiwCldeyr-IVLdz_Kxc"
 TARGET_FOLDER_ID = "1dt-L4A68Wu4KVuydb-zZi8b88sc1L5PH"
 
+# Global state for batch processing
+user_states = {}
+
 # --- GOOGLE SERVICES HELPER ---
 def get_creds():
     try:
@@ -104,6 +107,121 @@ def fetch_contract_data_via_ssh(url):
     except Exception as e:
         logging.error(f"SSH execution error: {e}")
         return None
+
+def fetch_contract_preview_via_ssh(contract_numbers):
+    """
+    Fetches preview information for multiple contracts via SSH.
+    Returns list of contracts with basic info.
+    """
+    try:
+        numbers_str = ','.join(contract_numbers)
+        ssh_command = [
+            "ssh", "ussr",
+            f"~/zakupki-parser/venv/bin/python ~/zakupki-parser/fetch_contracts_preview.py '{numbers_str}'"
+        ]
+        logging.info(f"Executing remote preview for {len(contract_numbers)} contracts")
+        result = subprocess.run(ssh_command, capture_output=True, text=False)
+        
+        if result.returncode != 0:
+            error_msg = result.stderr.decode('utf-8')
+            logging.error(f"Remote preview failed: {error_msg}")
+            return None
+            
+        json_output = result.stdout.decode('utf-8')
+        return json.loads(json_output)
+        
+    except Exception as e:
+        logging.error(f"SSH preview execution error: {e}")
+        return None
+
+# --- INPUT ANALYSIS ---
+def analyze_user_input(text):
+    """
+    Analyzes user input and determines the type of request.
+    Returns dict with type and data.
+    """
+    text = text.strip()
+    
+    # 1. Check for URL (existing functionality)
+    if 'zakupki.gov.ru' in text:
+        url_match = re.search(r'https?://[^\\s]+zakupki\.gov\.ru[^\\s]*', text)
+        if url_match:
+            return {'type': 'url', 'data': url_match.group()}
+    
+    # 2. Extract contract numbers
+    numbers = extract_contract_numbers(text)
+    if not numbers:
+        return {'type': 'unknown', 'data': None}
+    
+    if len(numbers) == 1:
+        return {'type': 'single_number', 'data': numbers[0]}
+    else:
+        return {'type': 'multiple_numbers', 'data': numbers}
+
+def extract_contract_numbers(text):
+    """
+    Extracts contract numbers from text.
+    Contract numbers are typically 19+ digits.
+    """
+    # Pattern for contract numbers (19+ digits)
+    pattern = r'\b(\d{19,})\b'
+    numbers = re.findall(pattern, text)
+    
+    # Validate and deduplicate
+    valid_numbers = []
+    for num in set(numbers):
+        if is_valid_contract_number(num):
+            valid_numbers.append(num)
+    
+    return valid_numbers
+
+def is_valid_contract_number(number):
+    """
+    Validates if a number looks like a contract registry number.
+    """
+    if len(number) < 19:
+        return False
+    
+    # Additional validation rules can be added here
+    # For now, just check length and format
+    return number.isdigit()
+
+def get_contract_url_from_number(number):
+    """
+    Converts contract number to full URL.
+    """
+    return f"https://zakupki.gov.ru/epz/contract/contractCard/common-info.html?reestrNumber={number}"
+
+def format_contract_list_preview(contracts):
+    """
+    Formats contract list preview for Telegram.
+    """
+    if not contracts:
+        return "❌ Контракты не найдены"
+    
+    # Group by year
+    years = {}
+    for contract in contracts:
+        year = contract.get('year', 'Unknown')
+        if year not in years:
+            years[year] = []
+        years[year].append(contract)
+    
+    msg = f"📋 **Найдено {len(contracts)} контрактов:**\\n\\n"
+    
+    for year, year_contracts in sorted(years.items(), reverse=True):
+        msg += f"🗓 **{year} год:** {len(year_contracts)} шт.\\n"
+        # Show first 2 contracts as examples
+        for i, contract in enumerate(year_contracts[:2]):
+            short_num = contract['number'][-6:]  # Last 6 digits
+            customer = contract.get('customer', 'N/A')[:30] + ('...' if len(contract.get('customer', '')) > 30 else '')
+            msg += f"  • К-{short_num}: {customer}\\n"
+        
+        if len(year_contracts) > 2:
+            msg += f"  • ...и еще {len(year_contracts) - 2}\\n"
+        msg += "\\n"
+    
+    return msg
 
 # --- UTILS ---
 def clean_number(value_str):
@@ -408,6 +526,179 @@ def add_contract_to_master(data):
         logging.error(f"Error updating sheet: {error_details}")
         return None, str(e)
 
+def add_contracts_by_year(contracts_data):
+    """
+    Adds contracts to separate sheets grouped by year.
+    Returns dict of year -> sheet_url
+    """
+    gc = get_gc()
+    if not gc:
+        return {}
+    
+    try:
+        sh = gc.open_by_key(MASTER_SHEET_ID)
+        sheet_urls = {}
+        
+        # Group contracts by year
+        contracts_by_year = {}
+        for contract in contracts_data:
+            # Extract year from contract number or date
+            year = extract_contract_year(contract)
+            if year not in contracts_by_year:
+                contracts_by_year[year] = []
+            contracts_by_year[year].append(contract)
+        
+        for year, contracts in contracts_by_year.items():
+            # Create or get sheet for the year
+            sheet_title = f"Контракты_{year}"
+            
+            try:
+                # Check if sheet exists
+                ws = sh.worksheet(sheet_title)
+            except gspread.WorksheetNotFound:
+                # Create new sheet
+                ws = sh.add_worksheet(title=sheet_title, rows=1000, cols=20)
+            
+            # Clear existing content
+            ws.clear()
+            
+            # Add header
+            header = [
+                "КОНТРАКТ", "Заказчик", "Цена", "Дата начала", 
+                "Дата окончания", "Ссылка", "Оплачено", "Принято", "Остаток лимита"
+            ]
+            ws.append_row(header)
+            
+            # Add contracts
+            for contract in contracts:
+                contract_price_clean = clean_number(contract.get('price', '0'))
+                paid_clean = clean_number(contract.get('execution', {}).get('paid', '0'))
+                accepted_clean = clean_number(contract.get('execution', {}).get('accepted', '0'))
+                
+                row = [
+                    contract.get('reestr_number', ''),
+                    contract.get('customer', ''),
+                    contract_price_clean,
+                    contract.get('date_start', ''),
+                    contract.get('date_end', ''),
+                    contract.get('url', ''),
+                    paid_clean,
+                    accepted_clean,
+                    f"={contract_price_clean}-{accepted_clean}"
+                ]
+                ws.append_row(row)
+            
+            sheet_urls[year] = ws.url
+        
+        return sheet_urls
+        
+    except Exception as e:
+        logging.error(f"Error adding contracts by year: {e}")
+        return {}
+
+def add_contracts_to_single_sheet(contracts_data):
+    """
+    Adds all contracts to a single sheet.
+    Returns list of sheet_urls (should be one)
+    """
+    gc = get_gc()
+    if not gc:
+        return []
+    
+    try:
+        sh = gc.open_by_key(MASTER_SHEET_ID)
+        
+        # Create sheet with timestamp
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        sheet_title = f"Партия_{timestamp}"
+        
+        ws = sh.add_worksheet(title=sheet_title, rows=1000, cols=20)
+        
+        # Add header
+        header = [
+            "КОНТРАКТ", "Заказчик", "Цена", "Дата начала", 
+            "Дата окончания", "Ссылка", "Оплачено", "Принято", "Остаток лимита"
+        ]
+        ws.append_row(header)
+        
+        # Add contracts
+        for contract in contracts_data:
+            contract_price_clean = clean_number(contract.get('price', '0'))
+            paid_clean = clean_number(contract.get('execution', {}).get('paid', '0'))
+            accepted_clean = clean_number(contract.get('execution', {}).get('accepted', '0'))
+            
+            row = [
+                contract.get('reestr_number', ''),
+                contract.get('customer', ''),
+                contract_price_clean,
+                contract.get('date_start', ''),
+                contract.get('date_end', ''),
+                contract.get('url', ''),
+                paid_clean,
+                accepted_clean,
+                f"={contract_price_clean}-{accepted_clean}"
+            ]
+            ws.append_row(row)
+        
+        return [ws.url]
+        
+    except Exception as e:
+        logging.error(f"Error adding contracts to single sheet: {e}")
+        return []
+
+def extract_contract_year(contract):
+    """
+    Extracts year from contract data.
+    """
+    # Try to get year from date_end or date_start
+    for date_field in ['date_end', 'date_start']:
+        date_str = contract.get(date_field, '')
+        if date_str:
+            # Extract 4-digit year from date string
+            year_match = re.search(r'(\d{4})', date_str)
+            if year_match:
+                return year_match.group(1)
+    
+    # Fallback: try to extract from contract number (some numbers contain year info)
+    contract_number = contract.get('reestr_number', '')
+    # Check if contract number contains year in last 2 digits + some pattern
+    if len(contract_number) >= 19:
+        # Try to extract year from position 15-16 (common in Russian procurement numbers)
+        potential_year = "20" + contract_number[14:16]
+        if 2020 <= int(potential_year) <= 2030:
+            return potential_year
+    
+    # Default to current year
+    return "2025"
+
+def send_batch_report(chat_id, processed, errors, sheet_urls, group_by_year):
+    """
+    Sends final report for batch processing.
+    """
+    msg = f"📊 **Обработка завершена!**\\n\\n"
+    msg += f"✅ Успешно: {processed}\\n"
+    
+    if errors:
+        msg += f"❌ Ошибок: {len(errors)}\\n\\n"
+        msg += "Ошибки:\\n"
+        for error in errors[:5]:  # Show first 5 errors
+            msg += f"• {error}\\n"
+        if len(errors) > 5:
+            msg += f"...и еще {len(errors) - 5}\\n"
+    else:
+        msg += "🎉 Без ошибок!\\n\\n"
+    
+    msg += "📋 **Созданы листы:**\\n"
+    if group_by_year:
+        for year, url in sheet_urls.items():
+            msg += f"🗓 {year} год: [Ссылка]({url})\\n"
+    else:
+        for url in sheet_urls:
+            msg += f"📄 [Партия]({url})\\n"
+    
+    bot.send_message(chat_id, msg, parse_mode='Markdown')
+
 
 
 # --- ROLES ---
@@ -475,43 +766,278 @@ def check_drive_access(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка:\n{e}")
 
-@bot.message_handler(func=lambda message: 'zakupki.gov.ru' in message.text)
-def handle_zakupki_link(message):
-    url = message.text.strip()
+# --- DIALOG HANDLERS FOR BATCH PROCESSING ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_single_'))
+def confirm_single_contract(call):
+    """
+    Handles confirmation for single contract parsing.
+    """
+    contract_number = call.data.replace('confirm_single_', '')
     
-    bot.reply_to(message, "🚀 Полный парсинг контракта (включая акты и товары)...\nЭто может занять 10-20 секунд.")
+    bot.answer_callback_query(call.id, "Начинаю парсинг...")
+    bot.edit_message_text(
+        chat_id=call.message.chat_id,
+        message_id=call.message.message_id,
+        text=f"🚀 Парсинг контракта {contract_number[-6:]}..."
+    )
     
+    url = get_contract_url_from_number(contract_number)
+    process_contract_parsing(call.message.chat_id, url)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('batch_by_year_'))
+def batch_by_year(call):
+    """
+    Handles batch processing grouped by year.
+    """
+    user_id = call.from_user.id
+    contract_numbers = user_states.get(user_id, {}).get('pending_contracts', [])
+    
+    bot.answer_callback_query(call.id, "Группирую по годам...")
+    
+    # Show progress
+    progress_msg = bot.edit_message_text(
+        chat_id=call.message.chat_id,
+        message_id=call.message.message_id,
+        text="📊 Подготавливаю пакетную обработку..."
+    )
+    
+    # Process contracts by year
+    process_batch_contracts(user_id, contract_numbers, group_by_year=True)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('batch_all_'))
+def batch_all_together(call):
+    """
+    Handles batch processing all together.
+    """
+    user_id = call.from_user.id
+    contract_numbers = user_states.get(user_id, {}).get('pending_contracts', [])
+    
+    bot.answer_callback_query(call.id, "Обрабатываю все вместе...")
+    
+    bot.edit_message_text(
+        chat_id=call.message.chat_id,
+        message_id=call.message.message_id,
+        text="📊 Подготавливаю пакетную обработку..."
+    )
+    
+    process_batch_contracts(user_id, contract_numbers, group_by_year=False)
+
+# --- MAIN MESSAGE HANDLER ---
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    """
+    Main handler that analyzes input and routes to appropriate processing.
+    """
+    user_id = message.from_user.id
+    analysis = analyze_user_input(message.text)
+    
+    if analysis['type'] == 'unknown':
+        bot.reply_to(message, 
+            "❓ Не удалось определить формат ввода.\\n\\n"
+            "Отправьте одно из следующего:\\n"
+            "• Ссылку на zakupki.gov.ru\\n"
+            "• Номер контракта (19+ цифр)\\n"
+            "• Список номеров через запятую или пробел")
+        return
+    
+    if analysis['type'] == 'url':
+        # Existing URL handling
+        url = analysis['data']
+        bot.reply_to(message, "🚀 Полный парсинг контракта (включая акты и товары)...\\nЭто может занять 10-20 секунд.")
+        process_contract_parsing(message.chat_id, url)
+    
+    elif analysis['type'] == 'single_number':
+        # Single contract number - show confirmation
+        contract_number = analysis['data']
+        show_single_contract_confirmation(message, contract_number)
+    
+    elif analysis['type'] == 'multiple_numbers':
+        # Multiple contracts - show preview and options
+        contract_numbers = analysis['data']
+        show_batch_options(message, contract_numbers)
+
+def show_single_contract_confirmation(message, contract_number):
+    """
+    Shows confirmation dialog for single contract.
+    """
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "✅ Да, парсить", 
+        callback_data=f"confirm_single_{contract_number}"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "❌ Отмена", 
+        callback_data="cancel_single"
+    ))
+    
+    short_num = contract_number[-6:]
+    bot.reply_to(message, 
+        f"🔍 **Найден контракт К-{short_num}**\\n\\n"
+        f"Полный номер: `{contract_number}`\\n\\n"
+        f"Продолжить парсинг?",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+def show_batch_options(message, contract_numbers):
+    """
+    Shows batch processing options for multiple contracts.
+    """
+    user_id = message.from_user.id
+    user_states[user_id] = {'pending_contracts': contract_numbers}
+    
+    # Get contract preview
+    contracts_preview = fetch_contract_preview_via_ssh(contract_numbers)
+    
+    if not contracts_preview:
+        bot.reply_to(message, "❌ Не удалось получить информацию о контрактах")
+        return
+    
+    # Show preview
+    preview_msg = format_contract_list_preview(contracts_preview)
+    bot.reply_to(message, preview_msg, parse_mode='Markdown')
+    
+    # Show options
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "📅 Создать листы по годам", 
+        callback_data="batch_by_year_"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "📄 Все в один лист", 
+        callback_data="batch_all_"
+    ))
+    markup.add(types.InlineKeyboardButton(
+        "❌ Отмена", 
+        callback_data="cancel_batch"
+    ))
+    
+    bot.reply_to(message, 
+        f"📋 **Как обработать {len(contract_numbers)} контрактов?**\\n\\n"
+        "Выберите способ группировки в Google Sheets:",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+def process_contract_parsing(chat_id, url):
+    """
+    Processes single contract parsing.
+    """
     # Use JSON parser
     data = fetch_contract_data_via_ssh(url)
     
     if not data or "error" in data:
          err = data.get("error", "Unknown error") if data else "No data received"
-         bot.reply_to(message, f"❌ Ошибка парсинга: {err}")
+         bot.send_message(chat_id, f"❌ Ошибка парсинга: {err}")
          return
          
     # Notify user about parsing result
-    response_text = f"✅ **Данные получены**\n"
-    response_text += f"Контракт: `{data.get('reestr_number')}`\n"
-    response_text += f"Цена: {data.get('price')}\n"
-    response_text += f"Оплачено: {data.get('execution', {}).get('paid')}\n"
+    response_text = f"✅ **Данные получены**\\n"
+    response_text += f"Контракт: `{data.get('reestr_number')}`\\n"
+    response_text += f"Цена: {data.get('price')}\\n"
+    response_text += f"Оплачено: {data.get('execution', {}).get('paid')}\\n"
     response_text += f"Товаров/Услуг найдено: {len(data.get('objects', []))}"
     
-    bot.reply_to(message, response_text, parse_mode='Markdown')
+    bot.send_message(chat_id, response_text, parse_mode='Markdown')
     
     # Update Sheet
-    bot.reply_to(message, "⏳ Добавляю в таблицу...")
+    bot.send_message(chat_id, "⏳ Добавляю в таблицу...")
     sheet_url, validation_result = add_contract_to_master(data)
     
     if sheet_url:
-        msg = f"📊 **Лист создан!**\n\nСсылка: {sheet_url}"
-        bot.reply_to(message, msg)
+        msg = f"📊 **Лист создан!**\\n\\nСсылка: {sheet_url}"
+        bot.send_message(chat_id, msg)
         
         # Add validation message if we have validation results
         if validation_result:
             validation_msg = format_validation_message(validation_result)
-            bot.reply_to(message, validation_msg, parse_mode='Markdown')
+            bot.send_message(chat_id, validation_msg, parse_mode='Markdown')
     else:
-        bot.reply_to(message, f"❌ Ошибка записи в таблицу")
+        bot.send_message(chat_id, "❌ Ошибка записи в таблицу")
+
+def process_batch_contracts(user_id, contract_numbers, group_by_year=True):
+    """
+    Processes batch contracts.
+    """
+    chat_id = user_id  # Simplified - in real app, track chat_id separately
+    
+    # Show initial progress
+    progress_msg = bot.send_message(chat_id, 
+        f"📊 **Начинаю пакетную обработку**\\n"
+        f"Контрактов: {len(contract_numbers)}\\n"
+        f"Группировка: {'по годам' if group_by_year else 'все вместе'}\\n\\n"
+        f"0/{len(contract_numbers)} завершено..."
+    )
+    
+    # Process contracts
+    processed = 0
+    errors = []
+    results = []
+    
+    for i, contract_number in enumerate(contract_numbers):
+        try:
+            url = get_contract_url_from_number(contract_number)
+            data = fetch_contract_data_via_ssh(url)
+            
+            if data and "error" not in data:
+                results.append(data)
+                processed += 1
+            else:
+                errors.append(f"К-{contract_number[-6:]}: {data.get('error', 'Unknown error') if data else 'No data'}")
+            
+            # Update progress every 3 contracts
+            if (i + 1) % 3 == 0 or i == len(contract_numbers) - 1:
+                progress_text = (
+                    f"📊 **Пакетная обработка**\\n"
+                    f"Контрактов: {len(contract_numbers)}\\n"
+                    f"Группировка: {'по годам' if group_by_year else 'все вместе'}\\n\\n"
+                    f"{processed}/{len(contract_numbers)} завершено..."
+                )
+                
+                if errors:
+                    progress_text += f"\\n⚠️ Ошибок: {len(errors)}"
+                
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_msg.message_id,
+                    text=progress_text
+                )
+            
+        except Exception as e:
+            errors.append(f"К-{contract_number[-6:]}: {str(e)}")
+            logging.error(f"Error processing contract {contract_number}: {e}")
+    
+    # Final results
+    if group_by_year:
+        sheet_urls = add_contracts_by_year(results)
+    else:
+        sheet_urls = add_contracts_to_single_sheet(results)
+    
+    # Send final report
+    send_batch_report(chat_id, processed, errors, sheet_urls, group_by_year)
+
+# --- CANCELLATION HANDLERS ---
+@bot.callback_query_handler(func=lambda call: call.data == 'cancel_single')
+def cancel_single(call):
+    bot.answer_callback_query(call.id, "Отменено")
+    bot.edit_message_text(
+        chat_id=call.message.chat_id,
+        message_id=call.message.message_id,
+        text="❌ Парсинг отменен"
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'cancel_batch')
+def cancel_batch(call):
+    user_id = call.from_user.id
+    if user_id in user_states:
+        del user_states[user_id]
+    
+    bot.answer_callback_query(call.id, "Отменено")
+    bot.edit_message_text(
+        chat_id=call.message.chat_id,
+        message_id=call.message.message_id,
+        text="❌ Пакетная обработка отменена"
+    )
 
 if __name__ == '__main__':
     logging.info("Бот запущен...")

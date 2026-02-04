@@ -519,6 +519,15 @@ def add_contract_to_master(data):
             ws.append_row(["(Детализация товаров не найдена или не спарсилась)"])
             validation_result = None
 
+        # CRITICAL: Share the sheet with public access
+        try:
+            sh.share('', perm_type='anyone', role='reader')
+            logging.info(f"Sheet {ws.title} made publicly accessible")
+        except Exception as e:
+            logging.error(f"Failed to make sheet public: {e}")
+            # Still return URL even if sharing fails
+            # User might have access through other means
+
         return ws.url, validation_result
         
     except Exception as e:
@@ -776,13 +785,13 @@ def confirm_single_contract(call):
     
     bot.answer_callback_query(call.id, "Начинаю парсинг...")
     bot.edit_message_text(
-        chat_id=call.message.chat_id,
+        chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text=f"🚀 Парсинг контракта {contract_number[-6:]}..."
     )
     
     url = get_contract_url_from_number(contract_number)
-    process_contract_parsing(call.message.chat_id, url)
+    process_contract_parsing(call.message.chat.id, url)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('batch_by_year_'))
 def batch_by_year(call):
@@ -796,7 +805,7 @@ def batch_by_year(call):
     
     # Show progress
     progress_msg = bot.edit_message_text(
-        chat_id=call.message.chat_id,
+        chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text="📊 Подготавливаю пакетную обработку..."
     )
@@ -815,7 +824,7 @@ def batch_all_together(call):
     bot.answer_callback_query(call.id, "Обрабатываю все вместе...")
     
     bot.edit_message_text(
-        chat_id=call.message.chat_id,
+        chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text="📊 Подготавливаю пакетную обработку..."
     )
@@ -945,8 +954,12 @@ def process_contract_parsing(chat_id, url):
     sheet_url, validation_result = add_contract_to_master(data)
     
     if sheet_url:
-        msg = f"📊 **Лист создан!**\\n\\nСсылка: {sheet_url}"
-        bot.send_message(chat_id, msg)
+        msg = f"📊 **Лист создан!**\\n\\n"
+        msg += f"🔗 **Ссылка:** [{sheet_url}]({sheet_url})\\n\\n"
+        msg += "📢 **Важно:** Таблица доступна по публичной ссылке\\n"
+        msg += "💾 Сохраните ссылку для будущего доступа"
+        
+        bot.send_message(chat_id, msg, parse_mode='Markdown', disable_web_page_preview=True)
         
         # Add validation message if we have validation results
         if validation_result:
@@ -1021,7 +1034,7 @@ def process_batch_contracts(user_id, contract_numbers, group_by_year=True):
 def cancel_single(call):
     bot.answer_callback_query(call.id, "Отменено")
     bot.edit_message_text(
-        chat_id=call.message.chat_id,
+        chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text="❌ Парсинг отменен"
     )
@@ -1034,7 +1047,7 @@ def cancel_batch(call):
     
     bot.answer_callback_query(call.id, "Отменено")
     bot.edit_message_text(
-        chat_id=call.message.chat_id,
+        chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text="❌ Пакетная обработка отменена"
     )

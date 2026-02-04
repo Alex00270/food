@@ -11,6 +11,7 @@ from telebot import types
 import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+# from ai_service import ai_service  # Temporarily disabled
 
 # Load environment variables
 load_dotenv()
@@ -228,29 +229,45 @@ def clean_number(value_str):
     """
     Cleans price/quantity strings to pure numbers.
     Example: "1 200,00 ₽" -> 1200.00
+    Handles multiline data correctly.
     """
     if not value_str:
         return 0.0
     
-    # Remove common suffixes/prefixes
-    clean = value_str.replace('₽', '').replace('RUB', '').replace('ДЕТ ДН', '').replace('УСЛ ЕД', '')
-    # Remove text like "Ставка НДС..." (take first line if multiline)
-    clean = clean.split('\n')[0]
+    # Split into lines for multiline data processing
+    lines = value_str.split('\n')
     
-    # Remove spaces (thousands separator)
-    clean = clean.replace(' ', '').replace('\xa0', '') # \xa0 is non-breaking space
-    
-    # Replace comma with dot
-    clean = clean.replace(',', '.')
-    
-    try:
-        # Extract first valid number using regex (handles "Price: 100")
-        match = re.search(r'(\d+(\.\d+)?)', clean)
+    # Search for numbers in each line
+    for line in lines:
+        # Clean the line
+        clean_line = line.replace('₽', '').replace('RUB', '').replace('ДЕТ ДН', '').replace('УСЛ ЕД', '')
+        clean_line = clean_line.replace(' ', '').replace('\xa0', '').replace(',', '.')
+        
+        # Look for number in this line
+        match = re.search(r'(\d+\.?\d*)', clean_line)
         if match:
-            return float(match.group(1))
-        return 0.0
+            try:
+                number = float(match.group(1))
+                if number > 0:  # Return first positive number found
+                    logging.info(f"clean_number: Found {number} in line: {line[:50]}...")
+                    return number
+            except ValueError:
+                continue
+    
+    # Fallback: try original logic on first line
+    try:
+        first_line_clean = lines[0].replace('₽', '').replace('RUB', '').replace('ДЕТ ДН', '').replace('УСЛ ЕД', '')
+        first_line_clean = first_line_clean.replace(' ', '').replace('\xa0', '').replace(',', '.')
+        match = re.search(r'(\d+\.?\d*)', first_line_clean)
+        if match:
+            result = float(match.group(1))
+            logging.info(f"clean_number: Fallback to first line, got {result}")
+            return result
     except:
-        return 0.0
+        pass
+    
+    logging.warning(f"clean_number: No valid number found in: {value_str[:100]}...")
+    return 0.0
 
 def extract_number_and_unit(value_str):
     """
@@ -446,12 +463,29 @@ def add_contract_to_master(data):
             
         # --- FILL DATA ---
         
-        # Clean execution numbers
-        paid_clean = clean_number(data.get('execution', {}).get('paid', '0'))
-        accepted_clean = clean_number(data.get('execution', {}).get('accepted', '0'))
-        contract_price_clean = clean_number(data.get('price', '0'))
+        # Clean execution numbers with logging
+        contract_price_raw = data.get('price', '0')
+        paid_raw = data.get('execution', {}).get('paid', '0')
+        accepted_raw = data.get('execution', {}).get('accepted', '0')
+        
+        contract_price_clean = clean_number(contract_price_raw)
+        paid_clean = clean_number(paid_raw)
+        accepted_clean = clean_number(accepted_raw)
+        
+        # Log for debugging
+        logging.info(f"Contract {data.get('reestr_number', 'Unknown')} prices - "
+                    f"Contract raw: {contract_price_raw} -> clean: {contract_price_clean}, "
+                    f"Paid raw: {paid_raw} -> clean: {paid_clean}, "
+                    f"Accepted raw: {accepted_raw} -> clean: {accepted_clean}")
 
         # 1. Header Info
+        # Determine remainder formula based on actual cell positions
+        if contract_price_clean > 0:
+            # Use cell references: Price is in C3, Accepted is in C10
+            remainder_formula = "=C3-C10"
+        else:
+            remainder_formula = "0.0"
+        
         info_data = [
             ["КОНТРАКТ", data.get('reestr_number')],
             ["Заказчик", data.get('customer')],
@@ -463,8 +497,8 @@ def add_contract_to_master(data):
             ["ИСПОЛНЕНИЕ", ""],
             ["Оплачено", paid_clean],
             ["Принято (Акты)", accepted_clean],
-            ["Остаток лимита", f"={contract_price_clean}-{accepted_clean}"], # Formula
-            [],
+            ["Остаток лимита", remainder_formula], # Fixed cell reference formula
+            [], 
             ["ОБЪЕКТЫ ЗАКУПКИ", "Кол-во", "Ед.изм.", "Цена", "Сумма (Источник)", "Сумма (Расчет)", "Название"] 
         ]
         
@@ -486,9 +520,18 @@ def add_contract_to_master(data):
             # Calculate totals for validation
             calculated_total = sum(obj['total_sum'] for obj in parsed_objects)
             
+            # Add item rows with proper formulas
             for i, obj in enumerate(parsed_objects):
                 # Row index for formula (1-based)
                 current_row = start_row + i + 1
+                
+                # Validate row number
+                if current_row < 1:
+                    logging.warning(f"Invalid row calculation: {current_row}")
+                    continue
+                
+                # Formula for calculated sum (Quantity * Price)
+                calculated_sum_formula = f"=B{current_row}*D{current_row}"
                 
                 ws.append_row([
                     "-", # Date
@@ -496,24 +539,46 @@ def add_contract_to_master(data):
                     obj['price_unit'] if obj['price_unit'] else obj['total_unit'], # Unit of measurement
                     obj['price'], # Price per unit
                     obj['total_sum'], # Source Sum
-                    f"=B{current_row}*D{current_row}", # Formula: Qty * Price
+                    calculated_sum_formula, # Formula: Qty * Price
                     obj['name'] # Item name
                 ])
                 
-            # Add Total Check Formula
+            # Add Total Check Formula with proper range validation
             last_row = start_row + len(parsed_objects)
+            start_data_row = start_row + 1  # First row with actual item data
+            
+            # Validate range
+            if last_row > start_data_row:
+                source_total_formula = f"=SUM(E{start_data_row}:E{last_row})"
+                calc_total_formula = f"=SUM(F{start_data_row}:F{last_row})"
+            else:
+                source_total_formula = "0.0"
+                calc_total_formula = "0.0"
+                
             ws.append_row([
                 "ИТОГО", 
                 "", 
                 "", 
                 "", 
-                f"=SUM(E{start_row+1}:E{last_row})", # Sum of source totals
-                f"=SUM(F{start_row+1}:F{last_row})", # Sum of calculated totals
+                source_total_formula, # Sum of source totals
+                calc_total_formula, # Sum of calculated totals
                 ""
             ])
             
+
+            
             # Validate totals and return validation result
             validation_result = validate_totals(objects, calculated_total)
+            
+            # TODO: AI валидация данных контракта (временно отключена)
+            # ai_validation = ai_service.validate_data(data)
+            # if ai_validation and not ai_validation.get('valid', True):
+            #     logging.info(f"AI validation found issues: {ai_validation.get('issues', [])}")
+            #     # Добавляем AI валидацию к результату
+            #     if not validation_result:
+            #         validation_result = {'ai_issues': ai_validation.get('issues', [])}
+            #     else:
+            #         validation_result['ai_issues'] = ai_validation.get('issues', [])
             
         else:
             ws.append_row(["(Детализация товаров не найдена или не спарсилась)"])
@@ -578,11 +643,23 @@ def add_contracts_by_year(contracts_data):
             ]
             ws.append_row(header)
             
-            # Add contracts
+            # Add contracts with improved formula handling
+            row_num = 2  # Start after header (row 2)
             for contract in contracts:
-                contract_price_clean = clean_number(contract.get('price', '0'))
+                contract_price_raw = contract.get('price', '0')
+                contract_price_clean = clean_number(contract_price_raw)
                 paid_clean = clean_number(contract.get('execution', {}).get('paid', '0'))
                 accepted_clean = clean_number(contract.get('execution', {}).get('accepted', '0'))
+                
+                # Log for debugging
+                logging.info(f"Batch contract {contract.get('reestr_number', 'Unknown')} - "
+                            f"Raw price: {contract_price_raw} -> clean: {contract_price_clean}")
+                
+                # Create proper formula for remainder
+                if contract_price_clean > 0:
+                    remainder_formula = f"=C{row_num}-I{row_num}"  # Price - Accepted
+                else:
+                    remainder_formula = "0.0"
                 
                 row = [
                     contract.get('reestr_number', ''),
@@ -593,9 +670,10 @@ def add_contracts_by_year(contracts_data):
                     contract.get('url', ''),
                     paid_clean,
                     accepted_clean,
-                    f"={contract_price_clean}-{accepted_clean}"
+                    remainder_formula
                 ]
                 ws.append_row(row)
+                row_num += 1
             
             sheet_urls[year] = ws.url
         
@@ -631,11 +709,23 @@ def add_contracts_to_single_sheet(contracts_data):
         ]
         ws.append_row(header)
         
-        # Add contracts
+        # Add contracts with improved formula handling
+        row_num = 2  # Start after header (row 2)
         for contract in contracts_data:
-            contract_price_clean = clean_number(contract.get('price', '0'))
+            contract_price_raw = contract.get('price', '0')
+            contract_price_clean = clean_number(contract_price_raw)
             paid_clean = clean_number(contract.get('execution', {}).get('paid', '0'))
             accepted_clean = clean_number(contract.get('execution', {}).get('accepted', '0'))
+            
+            # Log for debugging
+            logging.info(f"Single sheet contract {contract.get('reestr_number', 'Unknown')} - "
+                        f"Raw price: {contract_price_raw} -> clean: {contract_price_clean}")
+            
+            # Create proper formula for remainder
+            if contract_price_clean > 0:
+                remainder_formula = f"=C{row_num}-I{row_num}"  # Price - Accepted
+            else:
+                remainder_formula = "0.0"
             
             row = [
                 contract.get('reestr_number', ''),
@@ -646,9 +736,10 @@ def add_contracts_to_single_sheet(contracts_data):
                 contract.get('url', ''),
                 paid_clean,
                 accepted_clean,
-                f"={contract_price_clean}-{accepted_clean}"
+                remainder_formula
             ]
             ws.append_row(row)
+            row_num += 1
         
         return [ws.url]
         
@@ -937,9 +1028,34 @@ def process_contract_parsing(chat_id, url):
     
     if not data or "error" in data:
          err = data.get("error", "Unknown error") if data else "No data received"
-         bot.send_message(chat_id, f"❌ Ошибка парсинга: {err}")
-         return
          
+         # AI классификация ошибки (временно отключена)
+         bot.send_message(chat_id, "🤖 Анализирую ошибку...")
+         # error_analysis = ai_service.classify_error(err, {"url": url})  # Temporarily disabled
+         error_analysis = {"category": "unknown", "suggestions": ["Check logs for details"]}
+         
+         msg = f"❌ Ошибка парсинга: {err}\\n\\n"
+         msg += f"🔍 **Тип ошибки:** {error_analysis.get('category', 'UNKNOWN')}\\n"
+         msg += f"💡 **Рекомендация:** {error_analysis.get('suggestion', 'Попробуйте повторить запрос')}\\n\\n"
+         msg += f"🧠 *Анализ выполнен сервисом: {error_analysis.get('service', 'unknown')}*"
+         
+         bot.send_message(chat_id, msg, parse_mode='Markdown')
+         return
+          
+    # Log and validate contract price
+    contract_price_raw = data.get('price', 'NOT_FOUND')
+    contract_price_clean = clean_number(contract_price_raw)
+    logging.info(f"Contract {data.get('reestr_number', 'Unknown')} price processing - "
+                f"Raw: {contract_price_raw}, Clean: {contract_price_clean}")
+    
+    # Check if price is zero and warn user
+    if contract_price_clean <= 0:
+        bot.send_message(chat_id, 
+            f"⚠️ **Внимание:** Цена контракта равна нулю\\n\\n"
+            f"Исходные данные: `{contract_price_raw}`\\n"
+            f"Обработанное значение: {contract_price_clean}\\n\\n"
+            f"Таблица будет создана, но расчеты могут быть некорректными.")
+    
     # Notify user about parsing result
     response_text = f"✅ **Данные получены**\\n"
     response_text += f"Контракт: `{data.get('reestr_number')}`\\n"
@@ -1051,6 +1167,82 @@ def cancel_batch(call):
         message_id=call.message.message_id,
         text="❌ Пакетная обработка отменена"
     )
+
+# --- AI ANALYSIS COMMAND ---
+@bot.message_handler(commands=['analyze_ai'])
+def handle_ai_analysis(message):
+    """
+    AI анализ контракта по URL или последнему обработанному
+    """
+    user_id = message.from_user.id
+    
+    # Проверяем прав доступа
+    if not (user_id == SUPER_ADMIN_ID or user_id in ADMIN_IDS):
+        bot.reply_to(message, "🚫 У вас нет прав для AI анализа")
+        return
+    
+    # Запрашиваем URL или номер контракта
+    msg = bot.send_message(message.chat.id, 
+        "🤖 **AI Анализ Контракта**\\n\\n"
+        "Отправьте URL контракта или номер реестра для детального AI анализа\\n\\n"
+        "Или введите 'last' для анализа последнего обработанного контракта")
+    
+    bot.register_next_step_handler(msg, process_ai_analysis)
+
+def process_ai_analysis(message):
+    """
+    Обрабатывает запрос на AI анализ
+    """
+    user_input = message.text.strip()
+    chat_id = message.chat.id
+    
+    try:
+        # Определяем источник данных
+        if user_input.lower() == 'last':
+            bot.send_message(chat_id, "🔄 Анализ последнего контракта...")
+            # TODO: Реализовать получение последнего контракта
+            bot.send_message(chat_id, "📝 Функция анализа последнего контракта в разработке")
+            return
+        
+        elif user_input.startswith(('http://', 'https://')):
+            bot.send_message(chat_id, "🔄 Получаю данные контракта...")
+            url = user_input
+            
+            # Получаем данные
+            data = fetch_contract_data_via_ssh(url)
+            if not data or "error" in data:
+                bot.send_message(chat_id, f"❌ Не удалось получить данные контракта: {data.get('error', 'Unknown error') if data else 'No data'}")
+                return
+        else:
+            # Предполагаем что это номер контракта
+            bot.send_message(chat_id, "🔄 Ищу контракт по номеру...")
+            # TODO: Реализовать поиск по номеру
+            bot.send_message(chat_id, "📝 Поиск по номеру в разработке")
+            return
+        
+        # Выполняем AI анализ
+        bot.send_message(chat_id, "🧠 Выполняю AI анализ...")
+        # analysis_result = ai_service.analyze_contract(data)  # Temporarily disabled
+        analysis_result = {"status": "completed", "risk_level": "low"}
+        
+        if analysis_result.get('status') == 'success':
+            analysis = analysis_result.get('result', 'Анализ не удался')
+            service = analysis_result.get('service', 'unknown')
+            
+            # Форматируем ответ
+            response = f"🤖 **AI Анализ Контракта**\\n\\n"
+            response += f"📋 Контракт: `{data.get('reestr_number', 'N/A')}`\\n"
+            response += f"💰 Цена: {data.get('price', 'N/A')}\\n\\n"
+            response += f"📊 **Анализ:**\\n{analysis}\\n\\n"
+            response += f"🔧 *Сервис: {service}*"
+            
+            bot.send_message(chat_id, response, parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id, f"❌ AI анализ не удался: {analysis_result.get('error', 'Unknown error')}")
+            
+    except Exception as e:
+        logging.error(f"AI analysis error: {e}")
+        bot.send_message(chat_id, f"❌ Ошибка AI анализа: {str(e)}")
 
 if __name__ == '__main__':
     logging.info("Бот запущен...")

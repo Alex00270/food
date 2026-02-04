@@ -9,3 +9,5 @@ flask
 gspread
 beautifulsoup4
 lxml
+ollama-python>=0.3.0
+openai>=1.0.0

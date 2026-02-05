@@ -986,7 +986,7 @@ def add_contract_to_master(data, objects_changed=None, requisites_changed=None):
 
         ws = sh.add_worksheet(title=detail_title, rows=100, cols=20)
         ws.append_row(
-            ["ОБЪЕКТЫ ЗАКУПКИ", "Кол-во", "Ед.изм.", "Цена", "Сумма (Источник)", "Сумма (Расчет)", "Название"],
+            ["№", "Цена за единицу", "Ед.изм.", "Кол-во", "Сумма (Источник)", "Сумма (Расчет)", "Название"],
             value_input_option="USER_ENTERED"
         )
             
@@ -1006,7 +1006,7 @@ def add_contract_to_master(data, objects_changed=None, requisites_changed=None):
             calculated_total = sum(obj['total_sum'] for obj in parsed_objects)
             
             # Add item rows with proper formulas
-            for i, obj in enumerate(parsed_objects):
+            for i, obj in enumerate(parsed_objects, start=1):
                 # Row index for formula (1-based)
                 current_row = start_row + i + 1
                 
@@ -1019,10 +1019,10 @@ def add_contract_to_master(data, objects_changed=None, requisites_changed=None):
                 calculated_sum_formula = f"=B{current_row}*D{current_row}"
                 
                 ws.append_row([
-                    "-", # Date
-                    obj['qty'], # Calculated Quantity
-                    obj['price_unit'] if obj['price_unit'] else obj['total_unit'], # Unit of measurement
+                    i, # Position number
                     obj['price'], # Price per unit
+                    obj['price_unit'] if obj['price_unit'] else obj['total_unit'], # Unit of measurement
+                    obj['qty'], # Calculated Quantity
                     obj['total_sum'], # Source Sum
                     calculated_sum_formula, # Formula: Qty * Price
                     obj['name'] # Item name

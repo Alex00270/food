@@ -185,6 +185,15 @@ def init_db():
             requisites_hash TEXT
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rss_state (
+            reestr_number TEXT PRIMARY KEY,
+            feed_url TEXT,
+            last_guid TEXT,
+            last_pubdate TEXT,
+            last_checked TEXT
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -332,6 +341,10 @@ def ensure_contract_stub(reestr_number):
     cur.execute(
         "INSERT OR IGNORE INTO contracts (reestr_number) VALUES (?)",
         (reestr_number,)
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO rss_state (reestr_number, feed_url) VALUES (?, ?)",
+        (reestr_number, f"https://zakupki.gov.ru/epz/contract/contractCard/rss?reestrNumber={reestr_number}")
     )
     conn.commit()
     conn.close()

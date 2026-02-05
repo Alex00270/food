@@ -4,12 +4,17 @@ import re
 import traceback
 import subprocess
 import json
+import sqlite3
+import datetime
+import time
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import telebot
 from telebot import types
 import gspread
 from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 # from ai_service import ai_service  # Temporarily disabled
 
@@ -22,10 +27,21 @@ logging.basicConfig(
     level=logging.INFO
 )
 
+# Dedicated parsing logger
+parse_logger = logging.getLogger("parser")
+if not parse_logger.handlers:
+    parse_handler = logging.FileHandler(os.getenv('PARSE_LOG_PATH', 'parse.log'))
+    parse_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    parse_logger.addHandler(parse_handler)
+    parse_logger.setLevel(logging.INFO)
+
 token = os.getenv('TELEGRAM_TOKEN')
 super_admin_id = os.getenv('SUPER_ADMIN_ID')
 admin_ids_str = os.getenv('ADMIN_IDS')
 creds_path = os.getenv('GOOGLE_API_CREDENTIALS_PATH', 'credentials.json')
+oauth_creds_path = os.getenv('GOOGLE_OAUTH_CREDENTIALS_PATH', 'oauth_credentials.json')
+oauth_token_path = os.getenv('GOOGLE_OAUTH_TOKEN_PATH', 'token.json')
+DB_PATH = os.getenv('FOOD_DB_PATH', 'food.db')
 
 # --- CONFIGURATION ---
 SCOPES = [
@@ -60,10 +76,23 @@ user_states = {}
 
 # --- GOOGLE SERVICES HELPER ---
 def get_creds():
+    # Prefer OAuth user creds if token exists
+    try:
+        if oauth_token_path and os.path.exists(oauth_token_path):
+            creds = UserCredentials.from_authorized_user_file(oauth_token_path, SCOPES)
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+                with open(oauth_token_path, "w", encoding="utf-8") as f:
+                    f.write(creds.to_json())
+            return creds
+    except Exception as e:
+        logging.error(f"Failed to load OAuth token: {e}")
+
+    # Fallback to service account
     try:
         return Credentials.from_service_account_file(creds_path, scopes=SCOPES)
     except Exception as e:
-        logging.error(f"Failed to load credentials: {e}")
+        logging.error(f"Failed to load service account credentials: {e}")
         return None
 
 def get_gc():
@@ -84,56 +113,468 @@ def get_drive_service():
             logging.error(f"Failed to build drive service: {e}")
     return None
 
+def check_drive_folder_access():
+    if not TARGET_FOLDER_ID:
+        return False, "TARGET_FOLDER_ID not set"
+    service = get_drive_service()
+    if not service:
+        return False, "Drive service unavailable"
+    try:
+        meta = service.files().get(
+            fileId=TARGET_FOLDER_ID,
+            fields="id,name,mimeType"
+        ).execute()
+        if meta.get("mimeType") != "application/vnd.google-apps.folder":
+            return False, "TARGET_FOLDER_ID is not a folder"
+        # Try a lightweight list to confirm access
+        service.files().list(
+            q=f"'{TARGET_FOLDER_ID}' in parents and trashed=false",
+            pageSize=1,
+            fields="files(id)"
+        ).execute()
+        return True, meta.get("name", "")
+    except Exception as e:
+        logging.error(f"Drive folder access check failed: {e}")
+        return False, str(e)
+
+# --- SQLITE HELPERS ---
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS contracts (
+            reestr_number TEXT PRIMARY KEY,
+            customer TEXT,
+            price_clean REAL,
+            price_source TEXT,
+            date_start TEXT,
+            date_end TEXT,
+            url TEXT,
+            objects_hash TEXT,
+            requisites_hash TEXT,
+            last_checked TEXT,
+            last_changed TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS requisites_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reestr_number TEXT,
+            changed_at TEXT,
+            requisites_json TEXT,
+            requisites_hash TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS objects_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reestr_number TEXT,
+            changed_at TEXT,
+            objects_json TEXT,
+            objects_hash TEXT,
+            objects_total_clean REAL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            reestr_number TEXT,
+            checked_at TEXT,
+            price_clean REAL,
+            objects_hash TEXT,
+            requisites_hash TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_last_hashes(reestr_number):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT objects_hash, requisites_hash FROM contracts WHERE reestr_number = ?", (reestr_number,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row[0] or "", row[1] or ""
+    return "", ""
+
+def get_last_changed(reestr_number):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT last_changed FROM contracts WHERE reestr_number = ?", (reestr_number,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0]:
+        return row[0]
+    return None
+
+def record_check(data):
+    now = datetime.datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO checks (reestr_number, checked_at, price_clean, objects_hash, requisites_hash) VALUES (?, ?, ?, ?, ?)",
+        (
+            data.get("reestr_number", ""),
+            now,
+            float(data.get("price_clean", 0) or 0),
+            data.get("objects_hash", ""),
+            data.get("requisites_hash", "")
+        )
+    )
+    conn.commit()
+    conn.close()
+
+def upsert_contract(data, objects_changed, requisites_changed):
+    now = datetime.datetime.utcnow().isoformat()
+    last_changed = now if (objects_changed or requisites_changed) else get_last_changed(data.get("reestr_number", ""))
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO contracts (
+            reestr_number, customer, price_clean, price_source, date_start, date_end, url,
+            objects_hash, requisites_hash, last_checked, last_changed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(reestr_number) DO UPDATE SET
+            customer=excluded.customer,
+            price_clean=excluded.price_clean,
+            price_source=excluded.price_source,
+            date_start=excluded.date_start,
+            date_end=excluded.date_end,
+            url=excluded.url,
+            objects_hash=excluded.objects_hash,
+            requisites_hash=excluded.requisites_hash,
+            last_checked=excluded.last_checked,
+            last_changed=excluded.last_changed
+    """, (
+        data.get("reestr_number", ""),
+        data.get("customer", ""),
+        float(data.get("price_clean", 0) or 0),
+        data.get("price_source", ""),
+        data.get("date_start", ""),
+        data.get("date_end", ""),
+        data.get("url", ""),
+        data.get("objects_hash", ""),
+        data.get("requisites_hash", ""),
+        now,
+        last_changed
+    ))
+    conn.commit()
+    conn.close()
+
+def record_history(data, objects_changed, requisites_changed):
+    now = datetime.datetime.utcnow().isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    if objects_changed:
+        cur.execute(
+            "INSERT INTO objects_history (reestr_number, changed_at, objects_json, objects_hash, objects_total_clean) VALUES (?, ?, ?, ?, ?)",
+            (
+                data.get("reestr_number", ""),
+                now,
+                json.dumps(data.get("objects", []), ensure_ascii=False),
+                data.get("objects_hash", ""),
+                float(data.get("objects_total_clean", 0) or 0),
+            )
+        )
+    if requisites_changed:
+        cur.execute(
+            "INSERT INTO requisites_history (reestr_number, changed_at, requisites_json, requisites_hash) VALUES (?, ?, ?, ?)",
+            (
+                data.get("reestr_number", ""),
+                now,
+                json.dumps(data.get("requisites", {}), ensure_ascii=False),
+                data.get("requisites_hash", ""),
+            )
+        )
+    conn.commit()
+    conn.close()
+
+def determine_changes(data):
+    last_objects_hash, last_requisites_hash = get_last_hashes(data.get("reestr_number", ""))
+    objects_changed = (data.get("objects_hash", "") != last_objects_hash)
+    requisites_changed = (data.get("requisites_hash", "") != last_requisites_hash)
+    return objects_changed, requisites_changed
+
+def get_contract_numbers_from_db():
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT reestr_number FROM contracts")
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows if row and row[0]]
+
+def get_contract_numbers_from_registry():
+    gc = get_gc()
+    if not gc:
+        return []
+    try:
+        sh = gc.open_by_key(MASTER_SHEET_ID)
+        ws = get_registry_worksheet(sh)
+        values = ws.col_values(1)
+        if not values:
+            return []
+        numbers = []
+        for val in values[1:]:
+            val = (val or "").strip()
+            if is_valid_contract_number(val):
+                numbers.append(val)
+        return list(dict.fromkeys(numbers))
+    except Exception as e:
+        logging.warning(f"Failed to read registry sheet: {e}")
+        return []
+
+def ensure_contract_stub(reestr_number):
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO contracts (reestr_number) VALUES (?)",
+        (reestr_number,)
+    )
+    conn.commit()
+    conn.close()
+
+def add_contracts_to_registry(contract_numbers):
+    for number in contract_numbers:
+        ensure_contract_stub(number)
+        upsert_registry_row({"reestr_number": number}, False, False)
+
+def remove_contract_from_registry(reestr_number):
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM contracts WHERE reestr_number = ?", (reestr_number,))
+    cur.execute("DELETE FROM objects_history WHERE reestr_number = ?", (reestr_number,))
+    cur.execute("DELETE FROM requisites_history WHERE reestr_number = ?", (reestr_number,))
+    cur.execute("DELETE FROM checks WHERE reestr_number = ?", (reestr_number,))
+    conn.commit()
+    conn.close()
+
+    gc = get_gc()
+    if not gc:
+        return
+    try:
+        sh = gc.open_by_key(MASTER_SHEET_ID)
+        ws = get_registry_worksheet(sh)
+        cell = ws.find(reestr_number)
+        if cell:
+            ws.delete_rows(cell.row)
+    except gspread.exceptions.CellNotFound:
+        return
+    except Exception as e:
+        logging.warning(f"Failed to remove from registry sheet: {e}")
+
+def clear_registry():
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM contracts")
+    cur.execute("DELETE FROM objects_history")
+    cur.execute("DELETE FROM requisites_history")
+    cur.execute("DELETE FROM checks")
+    conn.commit()
+    conn.close()
+
+    gc = get_gc()
+    if not gc:
+        return
+    try:
+        sh = gc.open_by_key(MASTER_SHEET_ID)
+        ws = get_registry_worksheet(sh)
+        ws.resize(rows=1)
+    except Exception as e:
+        logging.warning(f"Failed to clear registry sheet: {e}")
+def safe_send(chat_id, text, **kwargs):
+    if not chat_id:
+        return
+    bot.send_message(chat_id, text, **kwargs)
+
+# --- GOOGLE SHEETS HELPERS ---
+def get_registry_worksheet(sh):
+    try:
+        return sh.worksheet("Registry")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Registry", rows=1000, cols=20)
+        header = [
+            "Reestr Number", "Customer", "Price", "Price Source",
+            "Date Start", "Date End", "URL",
+            "Objects Hash", "Requisites Hash",
+            "Last Checked (UTC)", "Last Changed (UTC)"
+        ]
+        ws.append_row(header)
+        return ws
+
+def upsert_registry_row(data, objects_changed, requisites_changed):
+    gc = get_gc()
+    if not gc:
+        return
+    sh = gc.open_by_key(MASTER_SHEET_ID)
+    ws = get_registry_worksheet(sh)
+    reestr_number = data.get("reestr_number", "")
+    now = datetime.datetime.utcnow().isoformat()
+    row = [
+        reestr_number,
+        data.get("customer", ""),
+        data.get("price_clean", 0),
+        data.get("price_source", ""),
+        data.get("date_start", ""),
+        data.get("date_end", ""),
+        data.get("url", ""),
+        data.get("objects_hash", ""),
+        data.get("requisites_hash", ""),
+        now,
+        now if (objects_changed or requisites_changed) else ""
+    ]
+    try:
+        cell = ws.find(reestr_number)
+        if cell:
+            ws.update(f"A{cell.row}:K{cell.row}", [row])
+        else:
+            ws.append_row(row)
+    except gspread.exceptions.CellNotFound:
+        ws.append_row(row)
+
+def create_contract_spreadsheet(gc, contract_number):
+    sh = gc.create(contract_number)
+    # Remove default sheet to keep only our sheets
+    try:
+        for ws in sh.worksheets():
+            if ws.title in ("Sheet1", "Лист1", "Лист 1"):
+                sh.del_worksheet(ws)
+                break
+    except Exception as e:
+        logging.warning(f"Failed to remove default sheet: {e}")
+    # Move to target folder if configured
+    try:
+        service = get_drive_service()
+        if service and TARGET_FOLDER_ID:
+            file_id = sh.id
+            # Add folder and remove root
+            service.files().update(
+                fileId=file_id,
+                addParents=TARGET_FOLDER_ID,
+                removeParents="root",
+                fields="id, parents"
+            ).execute()
+    except Exception as e:
+        logging.warning(f"Failed to move sheet to target folder: {e}")
+    return sh
+
+def find_existing_contract_sheet_id(contract_number):
+    service = get_drive_service()
+    if not service:
+        return None
+    try:
+        query = (
+            f"name = '{contract_number}' and "
+            f"mimeType = 'application/vnd.google-apps.spreadsheet' and "
+            f"trashed = false"
+        )
+        result = service.files().list(
+            q=query,
+            orderBy="modifiedTime desc",
+            fields="files(id, name, modifiedTime)",
+            pageSize=5
+        ).execute()
+        files = result.get("files", [])
+        if files:
+            return files[0]["id"]
+    except Exception as e:
+        logging.warning(f"Failed to find existing sheet by name: {e}")
+    return None
+
 # --- REMOTE PARSER ---
-def fetch_contract_data_via_ssh(url):
+def fetch_contract_data_via_ssh(url, max_retries=3, timeout=60):
     """
     Executes a remote script on 'ussr' to fetch FULL contract data as JSON.
     """
-    try:
-        ssh_command = [
-            "ssh", "ussr",
-            f"~/zakupki-parser/venv/bin/python ~/zakupki-parser/fetch_contract_data.py '{url}'"
-        ]
-        logging.info(f"Executing remote fetch (JSON) for: {url}")
-        result = subprocess.run(ssh_command, capture_output=True, text=False)
-        
-        if result.returncode != 0:
-            error_msg = result.stderr.decode('utf-8')
-            logging.error(f"Remote fetch failed: {error_msg}")
-            return None
+    for attempt in range(max_retries):
+        try:
+            start_ts = time.time()
+            ssh_command = [
+                "ssh",
+                "-o", "ConnectTimeout=30",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=2",
+                "ussr",
+                f"~/zakupki-parser/venv/bin/python ~/zakupki-parser/fetch_contract_data.py '{url}'"
+            ]
+            parse_logger.info(f"START fetch_contract_data url={url} attempt={attempt+1}")
+            result = subprocess.run(ssh_command, capture_output=True, text=False, timeout=timeout)
             
-        json_output = result.stdout.decode('utf-8')
-        return json.loads(json_output)
-        
-    except Exception as e:
-        logging.error(f"SSH execution error: {e}")
-        return None
+            if result.returncode != 0:
+                error_msg = result.stderr.decode('utf-8')
+                parse_logger.error(f"FAIL fetch_contract_data url={url} attempt={attempt+1} err={error_msg}")
+                if attempt == max_retries - 1:
+                    return None
+                time.sleep(2 ** attempt)
+                continue
+                
+            json_output = result.stdout.decode('utf-8')
+            duration = time.time() - start_ts
+            parse_logger.info(f"OK fetch_contract_data url={url} seconds={duration:.2f} attempt={attempt+1}")
+            return json.loads(json_output)
+            
+        except subprocess.TimeoutExpired:
+            parse_logger.error(f"TIMEOUT fetch_contract_data url={url} attempt={attempt+1} timeout={timeout}")
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            parse_logger.error(f"EXCEPTION fetch_contract_data url={url} attempt={attempt+1} err={e}")
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(2 ** attempt)
+    
+    return None
 
-def fetch_contract_preview_via_ssh(contract_numbers):
+def fetch_contract_preview_via_ssh(contract_numbers, max_retries=3, timeout=60):
     """
     Fetches preview information for multiple contracts via SSH.
     Returns list of contracts with basic info.
     """
-    try:
-        numbers_str = ','.join(contract_numbers)
-        ssh_command = [
-            "ssh", "ussr",
-            f"~/zakupki-parser/venv/bin/python ~/zakupki-parser/fetch_contracts_preview.py '{numbers_str}'"
-        ]
-        logging.info(f"Executing remote preview for {len(contract_numbers)} contracts")
-        result = subprocess.run(ssh_command, capture_output=True, text=False)
-        
-        if result.returncode != 0:
-            error_msg = result.stderr.decode('utf-8')
-            logging.error(f"Remote preview failed: {error_msg}")
-            return None
+    for attempt in range(max_retries):
+        try:
+            start_ts = time.time()
+            numbers_str = ','.join(contract_numbers)
+            ssh_command = [
+                "ssh",
+                "-o", "ConnectTimeout=30",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=2",
+                "ussr",
+                f"~/zakupki-parser/venv/bin/python ~/zakupki-parser/fetch_contracts_preview.py '{numbers_str}'"
+            ]
+            parse_logger.info(f"START fetch_contract_preview count={len(contract_numbers)} attempt={attempt+1}")
+            result = subprocess.run(ssh_command, capture_output=True, text=False, timeout=timeout)
             
-        json_output = result.stdout.decode('utf-8')
-        return json.loads(json_output)
-        
-    except Exception as e:
-        logging.error(f"SSH preview execution error: {e}")
-        return None
+            if result.returncode != 0:
+                error_msg = result.stderr.decode('utf-8')
+                parse_logger.error(f"FAIL fetch_contract_preview attempt={attempt+1} err={error_msg}")
+                if attempt == max_retries - 1:
+                    return None
+                time.sleep(2 ** attempt)
+                continue
+                
+            json_output = result.stdout.decode('utf-8')
+            duration = time.time() - start_ts
+            parse_logger.info(f"OK fetch_contract_preview count={len(contract_numbers)} seconds={duration:.2f} attempt={attempt+1}")
+            return json.loads(json_output)
+            
+        except subprocess.TimeoutExpired:
+            parse_logger.error(f"TIMEOUT fetch_contract_preview attempt={attempt+1} timeout={timeout}")
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            parse_logger.error(f"EXCEPTION fetch_contract_preview attempt={attempt+1} err={e}")
+            if attempt == max_retries - 1:
+                return None
+            time.sleep(2 ** attempt)
+    
+    return None
 
 # --- INPUT ANALYSIS ---
 def analyze_user_input(text):
@@ -434,33 +875,50 @@ def format_validation_message(validation_result):
     return msg
 
 # --- SHEET CREATION ---
-def add_contract_to_master(data):
+def add_contract_to_master(data, objects_changed=None, requisites_changed=None):
     """
-    Adds a new worksheet to the MASTER_SHEET_ID with FULL contract data.
+    Creates or updates a spreadsheet per contract.
+    Summary sheet + dated sheet for each change.
     """
+    init_db()
     gc = get_gc()
     if not gc:
         return None, "Ошибка подключения к Google Sheets"
 
     try:
-        # Open master sheet
-        sh = gc.open_by_key(MASTER_SHEET_ID)
-        
-        # Sheet title: Contract Number
-        base_title = f"К-{data.get('reestr_number', 'Unknown')[-6:]}"
-        title = base_title
-        
-        counter = 1
-        while True:
-            try:
-                sh.worksheet(title)
-                title = f"{base_title}_{counter}"
-                counter += 1
-            except gspread.WorksheetNotFound:
-                break
-            
-        ws = sh.add_worksheet(title=title, rows=100, cols=20)
-            
+        reestr_number = data.get('reestr_number', 'Unknown')
+        contract_title = reestr_number
+
+        ok, info = check_drive_folder_access()
+        if not ok:
+            return None, f"Нет доступа к папке Drive: {info}"
+
+        # Determine changes
+        if objects_changed is None or requisites_changed is None:
+            objects_changed, requisites_changed = determine_changes(data)
+
+        # Record check and history in DB
+        record_check(data)
+        record_history(data, objects_changed, requisites_changed)
+        upsert_contract(data, objects_changed, requisites_changed)
+
+        # Update registry sheet
+        upsert_registry_row(data, objects_changed, requisites_changed)
+
+        # Create or open contract spreadsheet (ignore trashed files)
+        existing_id = find_existing_contract_sheet_id(contract_title)
+        if existing_id:
+            sh = gc.open_by_key(existing_id)
+        else:
+            sh = create_contract_spreadsheet(gc, contract_title)
+
+        # Summary sheet
+        try:
+            summary_ws = sh.worksheet("Summary")
+        except gspread.WorksheetNotFound:
+            summary_ws = sh.add_worksheet(title="Summary", rows=100, cols=20)
+        summary_ws.clear()
+
         # --- FILL DATA ---
         
         # Clean execution numbers with logging
@@ -486,28 +944,55 @@ def add_contract_to_master(data):
         else:
             remainder_formula = "0.0"
         
+        requisites = data.get("requisites", {})
+
         info_data = [
             ["КОНТРАКТ", data.get('reestr_number')],
             ["Заказчик", data.get('customer')],
             ["Цена контракта", contract_price_clean],
+            ["Источник цены", data.get("price_source", "")],
             ["Дата начала", data.get('date_start', '-')],
             ["Дата окончания", data.get('date_end', '-')],
             ["Ссылка", data.get('url')],
+            ["Объекты HASH", data.get("objects_hash", "")],
+            ["Реквизиты HASH", data.get("requisites_hash", "")],
             [], 
             ["ИСПОЛНЕНИЕ", ""],
             ["Оплачено", paid_clean],
             ["Принято (Акты)", accepted_clean],
-            ["Остаток лимита", remainder_formula], # Fixed cell reference formula
-            [], 
-            ["ОБЪЕКТЫ ЗАКУПКИ", "Кол-во", "Ед.изм.", "Цена", "Сумма (Источник)", "Сумма (Расчет)", "Название"] 
+            ["Остаток лимита", remainder_formula],
+            [],
+            ["РЕКВИЗИТЫ", ""],
+            ["Банк", requisites.get("bank_name", "")],
+            ["БИК", requisites.get("bik", "")],
+            ["Р/С", requisites.get("account", "")],
+            ["К/С", requisites.get("corr_account", "")],
+            ["Лицевой счет", requisites.get("treasury_account", "")],
+            ["ИНН", requisites.get("inn", "")],
+            ["КПП", requisites.get("kpp", "")],
         ]
-        
         for row in info_data:
-            ws.append_row(row)
+            summary_ws.append_row(row, value_input_option="USER_ENTERED")
+
+        # Skip detailed sheet if no changes and already exists
+        today = datetime.date.today().isoformat()
+        detail_title = today
+        if not objects_changed and not requisites_changed:
+            try:
+                sh.worksheet(detail_title)
+                return summary_ws.url, None
+            except gspread.WorksheetNotFound:
+                pass
+
+        ws = sh.add_worksheet(title=detail_title, rows=100, cols=20)
+        ws.append_row(
+            ["ОБЪЕКТЫ ЗАКУПКИ", "Кол-во", "Ед.изм.", "Цена", "Сумма (Источник)", "Сумма (Расчет)", "Название"],
+            value_input_option="USER_ENTERED"
+        )
             
         # 2. Items Table
         objects = data.get('objects', [])
-        start_row = len(info_data) + 1
+        start_row = 1
         
         # Filter out total rows and parse all objects
         parsed_objects = []
@@ -541,7 +1026,7 @@ def add_contract_to_master(data):
                     obj['total_sum'], # Source Sum
                     calculated_sum_formula, # Formula: Qty * Price
                     obj['name'] # Item name
-                ])
+                ], value_input_option="USER_ENTERED")
                 
             # Add Total Check Formula with proper range validation
             last_row = start_row + len(parsed_objects)
@@ -563,7 +1048,7 @@ def add_contract_to_master(data):
                 source_total_formula, # Sum of source totals
                 calc_total_formula, # Sum of calculated totals
                 ""
-            ])
+            ], value_input_option="USER_ENTERED")
             
 
             
@@ -581,19 +1066,10 @@ def add_contract_to_master(data):
             #         validation_result['ai_issues'] = ai_validation.get('issues', [])
             
         else:
-            ws.append_row(["(Детализация товаров не найдена или не спарсилась)"])
+            ws.append_row(["(Детализация товаров не найдена или не спарсилась)"], value_input_option="USER_ENTERED")
             validation_result = None
 
-        # CRITICAL: Share the sheet with public access
-        try:
-            sh.share('', perm_type='anyone', role='reader')
-            logging.info(f"Sheet {ws.title} made publicly accessible")
-        except Exception as e:
-            logging.error(f"Failed to make sheet public: {e}")
-            # Still return URL even if sharing fails
-            # User might have access through other means
-
-        return ws.url, validation_result
+        return summary_ws.url, validation_result
         
     except Exception as e:
         error_details = traceback.format_exc()
@@ -978,6 +1454,7 @@ def show_single_contract_confirmation(message, contract_number):
         reply_markup=markup,
         parse_mode='Markdown'
     )
+    add_contracts_to_registry([contract_number])
 
 def show_batch_options(message, contract_numbers):
     """
@@ -985,6 +1462,7 @@ def show_batch_options(message, contract_numbers):
     """
     user_id = message.from_user.id
     user_states[user_id] = {'pending_contracts': contract_numbers}
+    add_contracts_to_registry(contract_numbers)
     
     # Get contract preview
     contracts_preview = fetch_contract_preview_via_ssh(contract_numbers)
@@ -1023,7 +1501,7 @@ def process_contract_parsing(chat_id, url):
     """
     Processes single contract parsing.
     """
-    # Use JSON parser
+    # Use JSON parser with enhanced archiving
     data = fetch_contract_data_via_ssh(url)
     
     if not data or "error" in data:
@@ -1041,20 +1519,55 @@ def process_contract_parsing(chat_id, url):
          
          bot.send_message(chat_id, msg, parse_mode='Markdown')
          return
-          
-    # Log and validate contract price
+    
+    # Enhanced price processing and archiving
+    contract_number = data.get('reestr_number', 'Unknown')
     contract_price_raw = data.get('price', 'NOT_FOUND')
     contract_price_clean = clean_number(contract_price_raw)
-    logging.info(f"Contract {data.get('reestr_number', 'Unknown')} price processing - "
-                f"Raw: {contract_price_raw}, Clean: {contract_price_clean}")
     
-    # Check if price is zero and warn user
+    # Check if we have debug info from enhanced parser
+    debug_info = data.get('debug_info', {})
+    
+    # Archive detailed contract data
+    try:
+        from contract_data_archiver import save_debug_data
+        files_saved = save_debug_data(data, contract_number, debug_info)
+        logging.info(f"Contract {contract_number} archived {len(files_saved)} files")
+    except ImportError:
+        logging.warning("Contract data archiver not available - basic parsing only")
+        files_saved = []
+    
+    # Enhanced price analysis
     if contract_price_clean <= 0:
-        bot.send_message(chat_id, 
-            f"⚠️ **Внимание:** Цена контракта равна нулю\\n\\n"
-            f"Исходные данные: `{contract_price_raw}`\\n"
-            f"Обработанное значение: {contract_price_clean}\\n\\n"
-            f"Таблица будет создана, но расчеты могут быть некорректными.")
+        warning_msg = f"⚠️ **Внимание:** Цена контракта = 0.0\\n\\n"
+        warning_msg += f"Исходные данные: `{contract_price_raw}`\\n\\n"
+        warning_msg += f"Обработанное значение: {contract_price_clean}\\n\\n"
+        
+        # Check if we have object totals for fallback
+        objects = data.get('objects', [])
+        if objects:
+            total_from_objects = sum(
+                float(obj.get('total', '0').replace(' ', '').replace(',', '.').replace('₽', '').replace('RUB', '').replace('Ставка НДС: 20%', '').replace('Ставка НДС: Без НДС', '')
+                )
+            )
+            if total_from_objects > 0:
+                warning_msg += f"\\n💡 **Fallback использована:** Сумма объектов = {total_from_objects:,.2f} руб\\n"
+                warning_msg += "Цена контракта будет обновлена из суммы объектов"
+                
+                # Update the price in data for Google Sheets
+                data['price'] = str(total_from_objects)
+                data['price_fallback_used'] = True
+                contract_price_clean = total_from_objects
+            else:
+                warning_msg += f"\\n❌ **Fallback не удался:** Не удалось рассчитать из объектов"
+        
+        warning_msg += f"\\n📁 **Архивировано файлов:** {len(files_saved)} шт"
+        
+        bot.send_message(chat_id, warning_msg, parse_mode='Markdown')
+    else:
+        logging.info(f"Contract {contract_number} price extracted successfully: {contract_price_clean}")
+        if files_saved:
+            logging.info(f"Contract {contract_number} archived {len(files_saved)} debug files")
     
     # Notify user about parsing result
     response_text = f"✅ **Данные получены**\\n"
@@ -1082,7 +1595,36 @@ def process_contract_parsing(chat_id, url):
             validation_msg = format_validation_message(validation_result)
             bot.send_message(chat_id, validation_msg, parse_mode='Markdown')
     else:
-        bot.send_message(chat_id, "❌ Ошибка записи в таблицу")
+        err = validation_result if isinstance(validation_result, str) else "Неизвестная ошибка"
+        bot.send_message(chat_id, f"❌ Ошибка записи в таблицу: {err}")
+
+def check_contract_update(chat_id, contract_number, silent=False):
+    """
+    Checks a contract by number and updates sheets/DB.
+    """
+    url = get_contract_url_from_number(contract_number)
+    parse_logger.info(f"CHECK start contract={contract_number}")
+    data = fetch_contract_data_via_ssh(url)
+    if not data or "error" in data:
+        err = data.get("error", "Unknown error") if data else "No data received"
+        parse_logger.error(f"CHECK fail contract={contract_number} err={err}")
+        safe_send(chat_id, f"❌ Ошибка проверки К-{contract_number[-6:]}: {err}")
+        return False, False
+
+    objects_changed, requisites_changed = determine_changes(data)
+    sheet_url, _ = add_contract_to_master(data, objects_changed, requisites_changed)
+    parse_logger.info(f"CHECK done contract={contract_number} objects_changed={objects_changed} requisites_changed={requisites_changed}")
+
+    if not silent:
+        if objects_changed or requisites_changed:
+            msg = f"✅ Обновлено К-{contract_number[-6:]} (изменения обнаружены)"
+        else:
+            msg = f"ℹ️ К-{contract_number[-6:]} без изменений"
+        if sheet_url:
+            msg += f"\nСводная: {sheet_url}"
+        safe_send(chat_id, msg)
+
+    return True, (objects_changed or requisites_changed)
 
 def process_batch_contracts(user_id, contract_numbers, group_by_year=True):
     """
@@ -1189,6 +1731,105 @@ def handle_ai_analysis(message):
     
     bot.register_next_step_handler(msg, process_ai_analysis)
 
+@bot.message_handler(commands=['check_contract'])
+def handle_check_contract(message):
+    """
+    Проверка одного контракта по номеру.
+    """
+    user_id = message.from_user.id
+    if not (user_id == SUPER_ADMIN_ID or user_id in ADMIN_IDS):
+        bot.reply_to(message, "🚫 У вас нет прав для этой команды")
+        return
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Введите номер контракта: /check_contract 3391704681226000001")
+        return
+    contract_number = parts[1].strip()
+    if not is_valid_contract_number(contract_number):
+        bot.reply_to(message, "Некорректный номер контракта")
+        return
+    bot.reply_to(message, f"🔄 Проверяю К-{contract_number[-6:]}...")
+    check_contract_update(message.chat.id, contract_number, silent=False)
+
+@bot.message_handler(commands=['check_all'])
+def handle_check_all(message):
+    """
+    Проверка всех контрактов из реестра (DB).
+    """
+    user_id = message.from_user.id
+    if not (user_id == SUPER_ADMIN_ID or user_id in ADMIN_IDS):
+        bot.reply_to(message, "🚫 У вас нет прав для этой команды")
+        return
+    contract_numbers = get_contract_numbers_from_registry()
+    if not contract_numbers:
+        contract_numbers = get_contract_numbers_from_db()
+    if not contract_numbers:
+        bot.reply_to(message, "Реестр пуст. Сначала добавьте контракты.")
+        return
+    bot.reply_to(message, f"🔄 Проверяю {len(contract_numbers)} контрактов...")
+    processed = 0
+    changed = 0
+    for number in contract_numbers:
+        ok, did_change = check_contract_update(message.chat.id, number, silent=True)
+        if ok:
+            processed += 1
+            if did_change:
+                changed += 1
+    bot.send_message(message.chat.id, f"✅ Проверка завершена. Всего: {processed}, с изменениями: {changed}")
+
+@bot.message_handler(commands=['add_contracts'])
+def handle_add_contracts(message):
+    """
+    Add contract numbers to registry without parsing.
+    """
+    user_id = message.from_user.id
+    if not (user_id == SUPER_ADMIN_ID or user_id in ADMIN_IDS):
+        bot.reply_to(message, "🚫 У вас нет прав для этой команды")
+        return
+    parts = message.text.strip().split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Введите номера контрактов: /add_contracts 339... 338... 337...")
+        return
+    raw = parts[1]
+    numbers = extract_contract_numbers(raw)
+    if not numbers:
+        bot.reply_to(message, "Не найдено корректных номеров (19+ цифр)")
+        return
+    add_contracts_to_registry(numbers)
+    bot.reply_to(message, f"✅ Добавлено в реестр: {len(numbers)}")
+
+@bot.message_handler(commands=['remove_contract'])
+def handle_remove_contract(message):
+    """
+    Remove a contract from registry and DB.
+    """
+    user_id = message.from_user.id
+    if not (user_id == SUPER_ADMIN_ID or user_id in ADMIN_IDS):
+        bot.reply_to(message, "🚫 У вас нет прав для этой команды")
+        return
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Введите номер контракта: /remove_contract 3391704681226000001")
+        return
+    contract_number = parts[1].strip()
+    if not is_valid_contract_number(contract_number):
+        bot.reply_to(message, "Некорректный номер контракта")
+        return
+    remove_contract_from_registry(contract_number)
+    bot.reply_to(message, f"✅ Удалено из реестра: {contract_number}")
+
+@bot.message_handler(commands=['clear_registry'])
+def handle_clear_registry(message):
+    """
+    Clear registry sheet and DB.
+    """
+    user_id = message.from_user.id
+    if not (user_id == SUPER_ADMIN_ID or user_id in ADMIN_IDS):
+        bot.reply_to(message, "🚫 У вас нет прав для этой команды")
+        return
+    clear_registry()
+    bot.reply_to(message, "✅ Реестр очищен")
+
 def process_ai_analysis(message):
     """
     Обрабатывает запрос на AI анализ
@@ -1246,4 +1887,18 @@ def process_ai_analysis(message):
 
 if __name__ == '__main__':
     logging.info("Бот запущен...")
-    bot.infinity_polling()
+    # Increase Telegram API timeouts for unstable networks
+    try:
+        from telebot import apihelper
+        apihelper.CONNECT_TIMEOUT = 10
+        apihelper.READ_TIMEOUT = 60
+    except Exception as e:
+        logging.warning(f"Failed to set Telegram timeouts: {e}")
+
+    # Resilient polling loop
+    while True:
+        try:
+            bot.infinity_polling(timeout=30, long_polling_timeout=30)
+        except Exception as e:
+            logging.error(f"Polling crashed: {e}")
+            time.sleep(5)
